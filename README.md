@@ -1,4 +1,4 @@
-# Distance-vector router (this folder)
+# Distance-vector router
 
 This directory contains only the assignment sources used to build and run the router daemon.
 
@@ -8,8 +8,6 @@ This directory contains only the assignment sources used to build and run the ro
 |------|------|
 | `router.py` | UDP/JSON distance-vector daemon; updates Linux routes with `ip route` |
 | `Dockerfile` | Alpine image with Python 3 and `iproute2` |
-
-All steps below assume your **current working directory is this folder** (`CNassign4`).
 
 ---
 
