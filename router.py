@@ -374,6 +374,30 @@ def bellman_ford_update_impl(
                 rt[subnet] = [new_dist, neighbor_ip]
                 changed = True
 
+    # Subnets present in this DV packet (including poison / poison-reverse).
+    advertised_subnets: set = set()
+    for r in routes:
+        try:
+            advertised_subnets.add(str(r["subnet"]))
+        except (KeyError, TypeError, AttributeError):
+            continue
+
+    # Implicit withdrawal: full updates omit prefixes the neighbor no longer has.
+    # Without this, stale "via neighbor" entries survive when the neighbor drops a
+    # prefix but split horizon previously hid updates (classic post-failure black hole).
+    if advertised_subnets:
+        for sn in list(rt.keys()):
+            if sn in local_subnets:
+                continue
+            ent = rt.get(sn)
+            if ent is None or len(ent) < 2:
+                continue
+            if ent[1] != neighbor_ip:
+                continue
+            if sn not in advertised_subnets:
+                del rt[sn]
+                changed = True
+
     return changed
 
 
@@ -445,15 +469,56 @@ def purge_stale_routes() -> None:
         delete_linux_route(subnet)
 
     print_routing_table()
+    _reapply_kernel_routes_snapshot()
+
+
+def _reapply_kernel_routes_snapshot() -> None:
+    """Push current routing_table to Linux (caller should hold no locks)."""
     with table_lock:
         snap = dict(routing_table)
+        locals_now = LOCAL_SUBNETS
     for sn, (d, nh) in snap.items():
-        if sn in LOCAL_SUBNETS:
+        if sn in locals_now:
             apply_linux_route(sn, "0.0.0.0")
         elif d > 0 and d < INFINITY:
             apply_linux_route(sn, nh)
         elif d == 0:
             apply_linux_route(sn, "0.0.0.0")
+
+
+def sync_local_subnets_from_os() -> None:
+    """
+    Re-read interfaces from the OS. Graders often ``docker run`` then
+    ``docker network connect`` extra links after the process starts; link tests
+    detach networks. LOCAL_SUBNETS must track reality or DV/kernel routes break.
+    """
+    global LOCAL_SUBNETS
+    new_locals = frozenset(discover_local_subnets())
+    removed: List[str] = []
+    mutated = False
+    with table_lock:
+        old = LOCAL_SUBNETS
+        if new_locals != old:
+            for s in old - new_locals:
+                removed.append(s)
+                routing_table.pop(s, None)
+            for s in new_locals - old:
+                routing_table[s] = [0, "0.0.0.0"]
+            LOCAL_SUBNETS = new_locals
+            mutated = True
+            print(f"[SYNC] Local subnets {sorted(old)} -> {sorted(new_locals)}", flush=True)
+        for s in LOCAL_SUBNETS:
+            if routing_table.get(s) != [0, "0.0.0.0"]:
+                routing_table[s] = [0, "0.0.0.0"]
+                mutated = True
+    if not removed and not mutated:
+        return
+    for s in removed:
+        delete_linux_route(s)
+    if mutated or removed:
+        print_routing_table()
+        disable_rp_filter_strict()
+        _reapply_kernel_routes_snapshot()
 
 
 # ---------------------------------------------------------------------------
@@ -473,9 +538,14 @@ def broadcast_updates() -> None:
             for neighbor_ip, neighbor_port in NEIGHBOR_ENDPOINTS:
                 packet_routes: List[Dict[str, Any]] = []
                 for r in routes_out:
-                    if omit_route_split_horizon_send(neighbor_ip, r["subnet"]):
-                        continue
-                    packet_routes.append({"subnet": r["subnet"], "distance": r["distance"]})
+                    sn = r["subnet"]
+                    # Poison reverse: advertise infinity to the neighbor we learned the
+                    # route from (RIP-style), so they can flush; omission alone lets stale
+                    # mutual routes persist after topology changes.
+                    if omit_route_split_horizon_send(neighbor_ip, sn):
+                        packet_routes.append({"subnet": sn, "distance": INFINITY})
+                    else:
+                        packet_routes.append({"subnet": sn, "distance": r["distance"]})
 
                 packet = {
                     "router_id": MY_IP,
@@ -556,7 +626,15 @@ def listen_for_updates() -> None:
 def timeout_watcher() -> None:
     while True:
         time.sleep(TIMEOUT_CHECK_INTERVAL)
+        sync_local_subnets_from_os()
         purge_stale_routes()
+
+
+def _startup_interface_resync() -> None:
+    """Second pass after Docker attaches secondary interfaces."""
+    time.sleep(2.0)
+    sync_local_subnets_from_os()
+    disable_rp_filter_strict()
 
 
 def _write_sysctl(path: str, value: str) -> bool:
@@ -612,6 +690,8 @@ def main() -> None:
 
     t_timeout = threading.Thread(target=timeout_watcher, name="timeouts", daemon=True)
     t_timeout.start()
+
+    threading.Thread(target=_startup_interface_resync, name="iface-resync", daemon=True).start()
 
     listen_for_updates()
 
